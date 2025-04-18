@@ -8,7 +8,7 @@ st.title("📈 StrikeFeed Deal Scanner")
 st.markdown("Prototype UI — displaying mock option chain data with Deal Scores")
 
 # Load mock data
-df = pd.read_csv("strikefeed_mock_data.csv")
+df = pd.read_csv("app/strikefeed_mock_data.csv")
 
 # Filters
 tickers = df["Ticker"].unique()
