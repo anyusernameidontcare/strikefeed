@@ -1,30 +1,48 @@
-
 import streamlit as st
 import pandas as pd
+import time
 
-st.set_page_config(page_title="StrikeFeed Option Scanner", layout="wide")
-
-st.title("📈 StrikeFeed Deal Scanner")
-st.markdown("Prototype UI — displaying mock option chain data with Deal Scores")
-
-# Load mock data
+# Load data
 df = pd.read_csv("app/strikefeed_mock_data.csv")
 
-# Filters
-tickers = df["Ticker"].unique()
-selected_ticker = st.selectbox("Select Ticker", options=["All"] + list(tickers))
+# Format Score column if it's a string %
+if df['Score'].dtype == 'object':
+    df['Score'] = df['Score'].str.replace('%', '', regex=False)
+    df['Score'] = pd.to_numeric(df['Score'], errors='coerce')
+
+# UI Config
+st.set_page_config(layout="wide")
+st.markdown("<h1 style='text-align: center;'>📈 StrikeFeed</h1>", unsafe_allow_html=True)
+
+# Timestamp
+st.markdown(f"<p style='text-align:center; color:gray;'>Last updated: {time.strftime('%I:%M:%S %p')}</p>", unsafe_allow_html=True)
+
+# Ticker search
+tickers = sorted(df['Ticker'].dropna().unique())
+selected_ticker = st.selectbox("Search Ticker", options=["All"] + tickers)
+
+# Score filter
 min_score = st.slider("Minimum Score", 0, 100, 0)
 
-# Apply filters
+# Filter data
 filtered_df = df.copy()
 if selected_ticker != "All":
-    filtered_df = filtered_df[filtered_df["Ticker"] == selected_ticker]
-filtered_df = filtered_df[filtered_df["Score"].fillna(0) >= min_score]
+    filtered_df = filtered_df[filtered_df['Ticker'] == selected_ticker]
 
-# Display
-st.dataframe(filtered_df.style.format({
-    "Bid": "${:.2f}", "Ask": "${:.2f}", "Delta": "{:.2f}", "IV": "{:.0%}", "Score": "{:.0f}"
-}), use_container_width=True)
+filtered_df = filtered_df[filtered_df['Score'].fillna(0) >= min_score]
 
+# Style score column
+def color_score(val):
+    if pd.isna(val): return ""
+    if val >= 80: return "background-color: #1fba55; color: white;"
+    elif val >= 60: return "background-color: #facc15; color: black;"
+    else: return "background-color: #ef4444; color: white;"
+
+styled_df = filtered_df.style.applymap(color_score, subset=["Score"])
+
+# Display table
+st.dataframe(styled_df, use_container_width=True)
+
+# Footer
 st.markdown("---")
-st.caption("Scores are mock values for demonstration purposes.")
+st.markdown("Scores are mock values for demonstration purposes.")
