@@ -1,48 +1,77 @@
 import streamlit as st
 import pandas as pd
-import time
+import datetime
+import pytz
 
-# Load data
-df = pd.read_csv("app/strikefeed_mock_data.csv")
+# ─────────────────────────────────────────────
+# Determine Market Status
+# ─────────────────────────────────────────────
 
-# Format Score column if it's a string %
-if df['Score'].dtype == 'object':
-    df['Score'] = df['Score'].str.replace('%', '', regex=False)
-    df['Score'] = pd.to_numeric(df['Score'], errors='coerce')
+def get_market_status():
+    now = datetime.datetime.now(pytz.timezone("US/Eastern"))
+    open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    weekday = now.weekday()
 
-# UI Config
+    if weekday >= 5:
+        return "closed"
+    elif now < open_time:
+        return "pre-market"
+    elif now > close_time:
+        return "after-hours"
+    else:
+        return "open"
+
+status = get_market_status()
+
+# ─────────────────────────────────────────────
+# Page Settings
+# ─────────────────────────────────────────────
+
 st.set_page_config(layout="wide")
-st.markdown("<h1 style='text-align: center;'>📈 StrikeFeed</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align: center; font-size: 3em;'>📈 StrikeFeed</h1>", unsafe_allow_html=True)
 
-# Timestamp
-st.markdown(f"<p style='text-align:center; color:gray;'>Last updated: {time.strftime('%I:%M:%S %p')}</p>", unsafe_allow_html=True)
+if status == "open":
+    st.markdown("<p style='text-align: right; color: #00e676;'>✅ Market Open</p>", unsafe_allow_html=True)
+elif status == "after-hours":
+    st.markdown("<p style='text-align: right; color: #facc15;'>🌙 After Hours</p>", unsafe_allow_html=True)
+else:
+    st.markdown("<p style='text-align: right; color: #ef4444;'>❌ Market Closed</p>", unsafe_allow_html=True)
 
-# Ticker search
-tickers = sorted(df['Ticker'].dropna().unique())
-selected_ticker = st.selectbox("Search Ticker", options=["All"] + tickers)
+# ─────────────────────────────────────────────
+# Load or mock data
+# ─────────────────────────────────────────────
 
-# Score filter
-min_score = st.slider("Minimum Score", 0, 100, 0)
+if status == "open":
+    df = pd.read_csv("app/strikefeed_mock_data.csv")  # Live later
+    df['Score'] = df['Score'].replace('%', '', regex=False).astype(float)
+else:
+    # Empty frame with dashes
+    cols = ["Strike", "Type", "Bid", "Ask", "Delta", "IV", "Score"]
+    df = pd.DataFrame({col: ["—"]*10 for col in cols})
 
-# Filter data
-filtered_df = df.copy()
-if selected_ticker != "All":
-    filtered_df = filtered_df[filtered_df['Ticker'] == selected_ticker]
+# ─────────────────────────────────────────────
+# Ticker Search
+# ─────────────────────────────────────────────
 
-filtered_df = filtered_df[filtered_df['Score'].fillna(0) >= min_score]
+tickers = sorted(df["Ticker"].dropna().unique()) if status == "open" else []
+selected_ticker = st.selectbox("🔍 Search Ticker", options=[""] + tickers)
 
-# Style score column
-def color_score(val):
-    if pd.isna(val): return ""
-    if val >= 80: return "background-color: #1fba55; color: white;"
-    elif val >= 60: return "background-color: #facc15; color: black;"
-    else: return "background-color: #ef4444; color: white;"
+if status == "open" and selected_ticker:
+    df = df[df["Ticker"] == selected_ticker]
 
-styled_df = filtered_df.style.applymap(color_score, subset=["Score"])
+# ─────────────────────────────────────────────
+# Display Table
+# ─────────────────────────────────────────────
 
-# Display table
-st.dataframe(styled_df, use_container_width=True)
+st.markdown("### ")
+st.dataframe(df.style.set_properties(**{
+    "text-align": "center"
+}), use_container_width=True)
 
+# ─────────────────────────────────────────────
 # Footer
-st.markdown("---")
-st.markdown("Scores are mock values for demonstration purposes.")
+# ─────────────────────────────────────────────
+
+st.markdown("### ")
+st.markdown("<div style='text-align:center; color:gray;'>StrikeFeed – Real-time options scanner</div>", unsafe_allow_html=True)
