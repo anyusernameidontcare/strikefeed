@@ -2,23 +2,22 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import yfinance as yf
 import datetime
+import yfinance as yf
 
-# =========================
+# ======================
 # 🔐 Tradier API Setup
-# =========================
-
-TRADIER_TOKEN = "OiteBPyAfIXoXsE1F0yoUV5pKddR" 
+# ======================
+TRADIER_TOKEN = "OiteBPyAfIXoXsE1F0yoUV5pKddR"
 TRADIER_HEADERS = {
     "Authorization": f"Bearer {TRADIER_TOKEN}",
     "Accept": "application/json"
 }
 BASE_URL = "https://api.tradier.com/v1/markets/options"
 
-# =========================
-# ⚙️ Utility Functions
-# =========================
+# ======================
+# 🔧 Utility Functions
+# ======================
 
 def fetch_expirations(symbol):
     url = f"{BASE_URL}/expirations"
@@ -26,78 +25,92 @@ def fetch_expirations(symbol):
     r = requests.get(url, headers=TRADIER_HEADERS, params=params)
     if r.status_code != 200:
         return []
-    return r.json().get("expirations", {}).get("date", [])
+    data = r.json()
+    return data.get("expirations", {}).get("date", [])
 
 def fetch_option_chain(symbol, expiration):
     url = f"{BASE_URL}/chains"
-    params = {"symbol": symbol, "expiration": expiration}
+    params = {"symbol": symbol, "expiration": expiration, "greeks": "true"}
     r = requests.get(url, headers=TRADIER_HEADERS, params=params)
     if r.status_code != 200:
-        return [], []
-    options = r.json().get("options", {}).get("option", [])
-    calls = [o for o in options if o.get("option_type") == "call"]
-    puts = [o for o in options if o.get("option_type") == "put"]
-    return calls, puts
+        return []
+    data = r.json()
+    return data.get("options", {}).get("option", [])
 
-def get_historical_volatility(symbol):
+def fetch_hv(symbol):
     try:
-        end = datetime.datetime.today()
-        start = end - datetime.timedelta(days=20)
-        df = yf.download(symbol, start=start, end=end)
-        df['returns'] = np.log(df['Close'] / df['Close'].shift(1))
-        hv = np.std(df['returns'].dropna()) * np.sqrt(252)
-        return hv
+        hist = yf.Ticker(symbol).history(period="30d")['Close']
+        returns = hist.pct_change().dropna()
+        std_dev = np.std(returns)
+        return std_dev * np.sqrt(252)
     except:
         return None
 
 def calculate_score(row, hv):
-    try:
-        if row['iv'] is None or hv is None:
-            return None
-        iv = float(row['iv'])
-        delta = abs(float(row['delta']))
-        spread = float(row['ask']) - float(row['bid'])
-        efficiency = 1 / (spread + 0.01)
-        score = ((iv / hv) * (1 - delta)) * efficiency
-        return round(score * 100, 2)
-    except:
+    if row["iv"] is None or hv is None or row["iv"] == 0:
         return None
+    iv_hv_ratio = row["iv"] / hv
+    if iv_hv_ratio == 0:
+        return None
+    score = (1 / iv_hv_ratio) * 100
+    score -= abs(row.get("delta", 0)) * 10
+    spread = (row.get("ask", 0) - row.get("bid", 0))
+    if spread > 0:
+        score -= (spread / (row.get("bid", 1) + 0.01)) * 5
+    return round(score, 2)
 
-def highlight_score(val):
-    if val is None:
-        return ''
-    color = 'red' if val < 60 else 'yellow' if val < 80 else 'green'
-    return f'color: {color}; font-weight: bold'
+def style_score(val):
+    if val is None or val == "—":
+        return "color: lightgray;"
+    if val >= 80:
+        return "color: #74d17a;"  # green
+    elif val >= 60:
+        return "color: #f4e36d;"  # yellow
+    else:
+        return "color: #e06666;"  # red
 
-# =========================
-# 🧠 App UI
-# =========================
+# ======================
+# 🚀 Streamlit UI
+# ======================
 
 st.markdown("<h1 style='text-align: center;'>📉 StrikeFeed</h1>", unsafe_allow_html=True)
 st.caption(f"Last updated: {datetime.datetime.utcnow().strftime('%H:%M:%S')} UTC")
 
-ticker = st.selectbox("🔍 Search Ticker", ["AAPL", "TSLA", "NVDA", "AMD", "MSFT", "META"], index=0)
+symbol = st.selectbox("🔍 Search Ticker", options=["AAPL", "TSLA", "NVDA", "AMD", "SPY"])
+expirations = fetch_expirations(symbol)
 
-expirations = fetch_expirations(ticker)
-expiration = st.selectbox("📅 Expiration", expirations) if expirations else None
+if not expirations:
+    st.warning("⚠️ No expirations found.")
+    st.stop()
 
-if expiration:
-    calls, puts = fetch_option_chain(ticker, expiration)
-    hv = get_historical_volatility(ticker)
+expiration = st.selectbox("📅 Expiration", options=expirations)
 
-    if calls and puts:
-        df = pd.DataFrame(calls + puts)
-        required_cols = ["option_type", "strike", "bid", "ask", "delta", "iv"]
+options = fetch_option_chain(symbol, expiration)
+hv = fetch_hv(symbol)
 
-        if all(col in df.columns for col in required_cols):
-            df = df[required_cols].copy()
-            df['score'] = df.apply(lambda row: calculate_score(row, hv), axis=1)
+# Construct UI table with dashes as fallback
+columns = ["Call Bid", "Call Ask", "Strike", "Put Bid", "Put Ask", "Score"]
+rows = []
 
-            styled_df = df.style.applymap(highlight_score, subset=["score"])
-            st.dataframe(styled_df, use_container_width=True)
-        else:
-            st.warning("⚠️ Some data fields are missing from Tradier's response.")
-    else:
-        st.warning("⚠️ No option chain data available for this expiration.")
-else:
-    st.warning("⚠️ No expirations available for this ticker.")
+call_chain = [o for o in options if o.get("option_type") == "call"]
+put_chain = [o for o in options if o.get("option_type") == "put"]
+
+for call, put in zip(call_chain, put_chain):
+    strike = call.get("strike", put.get("strike", "-"))
+    cb = call.get("bid", "-")
+    ca = call.get("ask", "-")
+    pb = put.get("bid", "-")
+    pa = put.get("ask", "-")
+    score = calculate_score(call, hv)
+    rows.append([
+        f"{cb:.2f}" if isinstance(cb, float) else "—",
+        f"{ca:.2f}" if isinstance(ca, float) else "—",
+        f"{strike:.2f}" if isinstance(strike, float) else "—",
+        f"{pb:.2f}" if isinstance(pb, float) else "—",
+        f"{pa:.2f}" if isinstance(pa, float) else "—",
+        score if score is not None else "—"
+    ])
+
+df = pd.DataFrame(rows, columns=columns)
+styled_df = df.style.applymap(style_score, subset=["Score"])
+st.dataframe(styled_df)
