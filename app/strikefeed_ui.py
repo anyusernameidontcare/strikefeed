@@ -1,119 +1,96 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
 import requests
+import pandas as pd
 import datetime
-import yfinance as yf
+import pytz
 
-# ======================
-# 🔐 Tradier API Setup
-# ======================
-TRADIER_TOKEN = "OiteBPyAfIXoXsE1F0yoUV5pKddR"
-TRADIER_HEADERS = {
-    "Authorization": f"Bearer {TRADIER_TOKEN}",
-    "Accept": "application/json"
-}
-BASE_URL = "https://api.tradier.com/v1/markets/options"
+st.set_page_config(layout="wide")
 
-# ======================
-# 🔧 Utility Functions
-# ======================
+# ----------------- SETTINGS -----------------
+API_KEY = "OiteBPyAfIXoXsE1F0yoUV5pKddR"  # Replace with your actual Tradier API key
+TICKERS = [
+    "AAPL", "MSFT", "GOOGL", "NVDA", "AMZN", "META", "TSLA", "AMD", "NFLX", "BABA",
+    "INTC", "CRM", "PYPL", "UBER", "SHOP", "SQ", "PLTR", "DIS", "NIO", "BIDU",
+    "MRNA", "COIN", "ROKU", "FSLR", "ZM", "DKNG", "RBLX", "SNOW", "SOFI", "ABNB",
+    "CVNA", "DKS", "FUBO", "TGT", "COST", "HD", "WMT", "LOW", "M", "JWN",
+    "CVX", "XOM", "BP", "OXY", "MPC", "PSX", "VLO", "PXD", "EOG", "COP",
+    "JPM", "BAC", "WFC", "GS", "MS", "C", "SCHW", "RY", "TD", "USB",
+    "PFE", "MRK", "JNJ", "LLY", "BMY", "ABBV", "GILD", "AZN", "AMGN", "BIIB",
+    "LUV", "DAL", "UAL", "AAL", "SAVE", "ALK", "RCL", "CCL", "NCLH", "EXPE",
+    "BA", "GE", "F", "GM", "TSM", "QCOM", "AVGO", "TXN", "ADI", "MU",
+    "SPY", "QQQ", "DIA", "IWM", "XLF", "XLE", "XLK", "ARKK", "TQQQ", "SQQQ"
+]
 
-def fetch_expirations(symbol):
-    url = f"{BASE_URL}/expirations"
-    params = {"symbol": symbol, "includeAllRoots": "true", "strikes": "false"}
-    r = requests.get(url, headers=TRADIER_HEADERS, params=params)
-    if r.status_code != 200:
-        return []
-    data = r.json()
-    return data.get("expirations", {}).get("date", [])
+# ----------------- FUNCTIONS -----------------
+def fetch_option_chain(ticker):
+    headers = {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"}
+    exp_url = f"https://api.tradier.com/v1/markets/options/expirations?symbol={ticker}&includeAllRoots=true&strikes=true"
+    exp_res = requests.get(exp_url, headers=headers).json()
+    expirations = exp_res.get("expirations", {}).get("date", [])
+    if not expirations:
+        return None, []
+    expiration = expirations[0]
+    chain_url = f"https://api.tradier.com/v1/markets/options/chains?symbol={ticker}&expiration={expiration}&greeks=true"
+    chain_res = requests.get(chain_url, headers=headers).json()
+    options = chain_res.get("options", {}).get("option", [])
+    return expiration, options
 
-def fetch_option_chain(symbol, expiration):
-    url = f"{BASE_URL}/chains"
-    params = {"symbol": symbol, "expiration": expiration, "greeks": "true"}
-    r = requests.get(url, headers=TRADIER_HEADERS, params=params)
-    if r.status_code != 200:
-        return []
-    data = r.json()
-    return data.get("options", {}).get("option", [])
-
-def fetch_hv(symbol):
+def fetch_current_price(ticker):
     try:
-        hist = yf.Ticker(symbol).history(period="30d")['Close']
-        returns = hist.pct_change().dropna()
-        std_dev = np.std(returns)
-        return std_dev * np.sqrt(252)
+        url = f"https://api.tradier.com/v1/markets/quotes?symbols={ticker}"
+        headers = {"Authorization": f"Bearer {API_KEY}", "Accept": "application/json"}
+        data = requests.get(url, headers=headers).json()
+        return float(data.get("quotes", {}).get("quote", {}).get("last", 0))
     except:
-        return None
+        return 0
 
-def calculate_score(row, hv):
-    if not isinstance(row, dict):
-        return None
-    iv = row.get("iv")
-    if iv is None or hv is None or iv == 0:
-        return None
-    iv_hv_ratio = iv / hv
-    if iv_hv_ratio == 0:
-        return None
-    score = (1 / iv_hv_ratio) * 100
-    score -= abs(row.get("delta", 0)) * 10
-    spread = (row.get("ask", 0) - row.get("bid", 0))
-    if spread > 0:
-        score -= (spread / (row.get("bid", 1) + 0.01)) * 5
-    return round(score, 2)
+def calculate_score(row):
+    try:
+        iv_call = row.get("greeks_iv_call", 0)
+        iv_put = row.get("greeks_iv_put", 0)
+        hv = (iv_call + iv_put) / 2 * 0.8
+        ratio = ((iv_call + iv_put) / 2) / hv
+        if ratio > 1.2:
+            return "High"
+        elif ratio > 0.9:
+            return "Medium"
+        else:
+            return "Low"
+    except:
+        return "—"
 
-def style_score(val):
-    if val is None or val == "—":
-        return "color: lightgray;"
-    if val >= 80:
-        return "color: #74d17a;"  # green
-    elif val >= 60:
-        return "color: #f4e36d;"  # yellow
-    else:
-        return "color: #e06666;"  # red
+def color_score(val):
+    color = "green" if val == "High" else "orange" if val == "Medium" else "red" if val == "Low" else "white"
+    return f"color: {color}; font-weight: bold"
 
-# ======================
-# 🚀 Streamlit UI
-# ======================
+def build_chain_table(options, current_price):
+    df = pd.DataFrame(options)
+    df = df.sort_values(by="strike")
+    filtered = df[(df.strike >= current_price - 15) & (df.strike <= current_price + 15)]
+    calls = filtered[filtered.option_type == "call"].copy()
+    puts = filtered[filtered.option_type == "put"].copy()
+    merged = pd.merge(calls, puts, on="strike", how="outer", suffixes=("_call", "_put"))
+    merged["score"] = merged.apply(lambda row: calculate_score(row), axis=1)
+    return pd.DataFrame({
+        "Call Bid": merged["bid_call"].fillna("—"),
+        "Call Ask": merged["ask_call"].fillna("—"),
+        "Strike": merged["strike"].fillna("—"),
+        "Put Bid": merged["bid_put"].fillna("—"),
+        "Put Ask": merged["ask_put"].fillna("—"),
+        "Score": merged["score"].fillna("—")
+    })
 
-st.markdown("<h1 style='text-align: center;'>📉 StrikeFeed</h1>", unsafe_allow_html=True)
-st.caption(f"Last updated: {datetime.datetime.utcnow().strftime('%H:%M:%S')} UTC")
+# ----------------- APP -----------------
+st.title("📊 StrikeFeed Options Scanner")
+ticker = st.selectbox("Choose Ticker:", TICKERS)
+current_price = fetch_current_price(ticker)
+st.markdown(f"**Live Price: ${current_price:.2f}**")
 
-symbol = st.selectbox("🔍 Search Ticker", options=["AAPL", "TSLA", "NVDA", "AMD", "SPY"])
-expirations = fetch_expirations(symbol)
+expiration, chain = fetch_option_chain(ticker)
 
-if not expirations:
-    st.warning("⚠️ No expirations found.")
-    st.stop()
-
-expiration = st.selectbox("📅 Expiration", options=expirations)
-
-options = fetch_option_chain(symbol, expiration)
-hv = fetch_hv(symbol)
-
-# Construct UI table with dashes as fallback
-columns = ["Call Bid", "Call Ask", "Strike", "Put Bid", "Put Ask", "Score"]
-rows = []
-
-call_chain = [o for o in options if o.get("option_type") == "call"]
-put_chain = [o for o in options if o.get("option_type") == "put"]
-
-for call, put in zip(call_chain, put_chain):
-    strike = call.get("strike", put.get("strike", "-"))
-    cb = call.get("bid", "-")
-    ca = call.get("ask", "-")
-    pb = put.get("bid", "-")
-    pa = put.get("ask", "-")
-    score = calculate_score(call, hv)
-    rows.append([
-        f"{cb:.2f}" if isinstance(cb, float) else "—",
-        f"{ca:.2f}" if isinstance(ca, float) else "—",
-        f"{strike:.2f}" if isinstance(strike, float) else "—",
-        f"{pb:.2f}" if isinstance(pb, float) else "—",
-        f"{pa:.2f}" if isinstance(pa, float) else "—",
-        score if score is not None else "—"
-    ])
-
-df = pd.DataFrame(rows, columns=columns)
-styled_df = df.style.applymap(style_score, subset=["Score"])
-st.dataframe(styled_df)
+if not chain:
+    st.warning("No data. Showing placeholder.")
+    st.write(pd.DataFrame({"Call Bid": ["—"] * 5, "Call Ask": ["—"] * 5, "Strike": ["—"] * 5, "Put Bid": ["—"] * 5, "Put Ask": ["—"] * 5, "Score": ["—"] * 5}))
+else:
+    table = build_chain_table(chain, current_price)
+    st.dataframe(table.style.applymap(color_score, subset=["Score"]))
