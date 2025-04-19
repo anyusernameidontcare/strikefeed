@@ -2,125 +2,103 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import datetime
-import pytz
 import requests
 import yfinance as yf
+import pytz
 
-# ----------------------------------------------------
-# API Tokens
-# ----------------------------------------------------
-TRADIER_TOKEN = "eA5AZaGxFGOfVxMqtIS7GAA4ZS7W"  # Replace with your actual Tradier API token
+# ================================
+# Tradier API Configuration
+# ================================
+TRADIER_TOKEN = "OiteBPyAfIXoXsE1F0yoUV5pKddR"
 TRADIER_HEADERS = {
     "Authorization": f"Bearer {TRADIER_TOKEN}",
     "Accept": "application/json"
 }
+TRADIER_BASE = "https://api.tradier.com/v1"
 
-# ----------------------------------------------------
-# Helper Functions
-# ----------------------------------------------------
+# ================================
+# Utility Functions
+# ================================
+def fetch_option_expirations(ticker):
+    url = f"{TRADIER_BASE}/markets/options/expirations"
+    params = {"symbol": ticker, "includeAllRoots": "true", "strikes": "false"}
+    r = requests.get(url, headers=TRADIER_HEADERS, params=params)
+    data = r.json()
+    return data.get("expirations", {}).get("date", [])
 
-def get_option_expirations(symbol):
-    url = f"https://api.tradier.com/v1/markets/options/expirations"
-    params = {"symbol": symbol, "includeAllRoots": "true", "strikes": "false"}
-    response = requests.get(url, headers=TRADIER_HEADERS, params=params)
-    if response.status_code != 200:
-        return []
-    return response.json().get("expirations", {}).get("date", [])
+def fetch_option_chain(ticker, expiration):
+    url = f"{TRADIER_BASE}/markets/options/chains"
+    params = {"symbol": ticker, "expiration": expiration, "greeks": "true"}
+    r = requests.get(url, headers=TRADIER_HEADERS, params=params)
+    data = r.json()
+    return data.get("options", {}).get("option", [])
 
-def get_option_chain(symbol, expiration):
-    url = f"https://api.tradier.com/v1/markets/options/chains"
-    params = {"symbol": symbol, "expiration": expiration, "greeks": "true"}
-    response = requests.get(url, headers=TRADIER_HEADERS, params=params)
-    if response.status_code != 200:
-        return [], []
-    options = response.json().get("options", {}).get("option", [])
-    calls = [o for o in options if o["option_type"] == "call"]
-    puts = [o for o in options if o["option_type"] == "put"]
-    return calls, puts
-
-def get_historical_volatility(symbol):
+def get_historical_volatility(ticker):
     try:
-        data = yf.Ticker(symbol).history(period="1mo")
-        returns = data["Close"].pct_change().dropna()
-        hv = np.std(returns) * np.sqrt(252)
+        data = yf.download(ticker, period="1mo")['Close']
+        log_returns = np.log(data / data.shift(1)).dropna()
+        hv = np.std(log_returns) * np.sqrt(252)
         return hv
     except:
         return None
 
-def score_option(iv, hv, bid, ask, delta):
-    if iv is None or hv is None or bid is None or ask is None:
+def calculate_score(row, hv):
+    if row['iv'] is None or hv is None:
         return None
-
-    # Score is weighted based on IV/HV ratio, tight spread, and delta
-    iv_hv_ratio = iv / hv if hv else 0
-    spread = ask - bid if ask and bid else 0
-    spread_score = 1 - min(spread / max(ask, 0.01), 1)
-    delta_score = 1 - abs(delta)
-
-    score = (iv_hv_ratio * 0.5 + spread_score * 0.3 + delta_score * 0.2) * 100
+    iv_hv_ratio = row['iv'] / hv if hv > 0 else 0
+    spread = row['ask'] - row['bid'] if row['ask'] and row['bid'] else None
+    if spread is None:
+        return None
+    spread_penalty = min(spread / (row['ask'] + 0.01), 1)
+    delta_score = 1 - abs(0.5 - abs(row['delta']))
+    score = (1 / iv_hv_ratio) * 50 + delta_score * 30 + (1 - spread_penalty) * 20
     return round(score, 2)
 
-# ----------------------------------------------------
-# Streamlit UI
-# ----------------------------------------------------
+def highlight_score(val):
+    if val is None:
+        return ""
+    if val >= 80:
+        return "color: #55ff55"
+    elif val >= 60:
+        return "color: #ffff66"
+    else:
+        return "color: #ff6666"
+
+# ================================
+# Streamlit App
+# ================================
 st.set_page_config(page_title="StrikeFeed", layout="wide")
 st.markdown("""
     <h1 style='text-align: center;'>📈 StrikeFeed</h1>
-    <p style='text-align: center; font-size: 0.9em;'>Last updated: {} UTC</p>
-""".format(datetime.datetime.utcnow().strftime("%I:%M:%S %p")), unsafe_allow_html=True)
+    <p style='text-align: center;'>Last updated: {}</p>
+    """.format(datetime.datetime.now(pytz.UTC).strftime("%H:%M:%S %Z")), unsafe_allow_html=True)
 
-symbol = st.selectbox("🔍 Search Ticker", options=["AAPL", "NVDA", "TSLA", "AMD"], index=0)
-expirations = get_option_expirations(symbol)
-expiration = st.selectbox("Expiration", options=expirations)
+ticker = st.selectbox("🔍 Search Ticker", options=["AAPL", "NVDA", "TSLA", "AMD"], index=0)
+if ticker:
+    expirations = fetch_option_expirations(ticker)
+    expiration = st.selectbox("Expiration", options=expirations)
 
-if symbol and expiration:
-    calls, puts = get_option_chain(symbol, expiration)
-    hv = get_historical_volatility(symbol)
+    if expiration:
+        options = fetch_option_chain(ticker, expiration)
+        if options:
+            df = pd.DataFrame(options)
+            hv = get_historical_volatility(ticker)
+            df['score'] = df.apply(lambda row: calculate_score(row, hv), axis=1)
 
-    calls_df = pd.DataFrame(calls)
-    puts_df = pd.DataFrame(puts)
+            calls = df[df['option_type'] == 'call'][['strike', 'bid', 'ask', 'delta', 'iv', 'score']]
+            puts = df[df['option_type'] == 'put'][['strike', 'bid', 'ask', 'delta', 'iv', 'score']]
 
-    if "strike" in calls_df.columns:
-        calls_df = calls_df.set_index("strike")
-    else:
-        calls_df = pd.DataFrame(columns=["bid", "ask", "delta", "iv", "score"])
+            calls.columns = ["Strike", "Call Bid", "Call Ask", "Delta", "IV", "Score"]
+            puts.columns = ["Strike", "Put Bid", "Put Ask", "Delta", "IV", "Score"]
 
-    if "strike" in puts_df.columns:
-        puts_df = puts_df.set_index("strike")
-    else:
-        puts_df = pd.DataFrame(columns=["bid", "ask", "delta", "iv", "score"])
+            combined = pd.merge(calls, puts, on="Strike", how="outer", suffixes=("", ""))
+            combined = combined.sort_values("Strike")
 
-    for df in [calls_df, puts_df]:
-        for idx in df.index:
-            row = df.loc[idx]
-            iv = row.get("greeks", {}).get("iv")
-            delta = row.get("greeks", {}).get("delta")
-            bid = row.get("bid")
-            ask = row.get("ask")
-            score = score_option(iv, hv, bid, ask, delta)
-            df.at[idx, "iv"] = iv
-            df.at[idx, "delta"] = delta
-            df.at[idx, "score"] = score
-
-    combined = pd.concat([
-        calls_df[["bid", "ask", "delta", "iv", "score"]].rename(columns={"bid": "Call Bid", "ask": "Call Ask"}),
-        pd.DataFrame(index=calls_df.index).index.to_frame(name="Strike"),
-        puts_df[["bid", "ask", "delta", "iv", "score"]].rename(columns={"bid": "Put Bid", "ask": "Put Ask", "score": "Score"})
-    ], axis=1)
-
-    def highlight_score(val):
-        if val is None:
-            return "color: #ccc"
-        val = float(val)
-        if val >= 80:
-            return "color: lightgreen"
-        elif val >= 60:
-            return "color: gold"
+            st.dataframe(
+                combined.reset_index(drop=True)
+                .style.applymap(highlight_score, subset=["Score_x", "Score_y"])
+            )
         else:
-            return "color: lightcoral"
-
-    st.dataframe(combined.reset_index(drop=True).style.applymap(highlight_score, subset=["Score"]))
-
-    st.markdown("""
-    <p style='text-align: center; font-size: 0.8em;'>StrikeFeed — Powered by Tradier + Yahoo</p>
-    """, unsafe_allow_html=True)
+            st.warning("No option data available.")
+    else:
+        st.warning("Select an expiration date.")
