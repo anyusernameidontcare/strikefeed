@@ -2,102 +2,102 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import datetime
 import yfinance as yf
+import datetime
 
-# ======================
-# ✅ Tradier API Setup
-# ======================
-TRADIER_TOKEN = "OiteBPyAfIXoXsE1F0yoUV5pKddR"
+# =========================
+# 🔐 Tradier API Setup
+# =========================
+
+TRADIER_TOKEN = "OiteBPyAfIXoXsE1F0yoUV5pKddR" 
 TRADIER_HEADERS = {
     "Authorization": f"Bearer {TRADIER_TOKEN}",
     "Accept": "application/json"
 }
 BASE_URL = "https://api.tradier.com/v1/markets/options"
 
-# ======================
-# 🔁 Utility Functions
-# ======================
+# =========================
+# ⚙️ Utility Functions
+# =========================
 
 def fetch_expirations(symbol):
     url = f"{BASE_URL}/expirations"
     params = {"symbol": symbol, "includeAllRoots": "true", "strikes": "false"}
     r = requests.get(url, headers=TRADIER_HEADERS, params=params)
-    data = r.json()
-    return data.get("expirations", {}).get("date", [])
+    if r.status_code != 200:
+        return []
+    return r.json().get("expirations", {}).get("date", [])
 
-def fetch_options_chain(symbol, expiration):
+def fetch_option_chain(symbol, expiration):
     url = f"{BASE_URL}/chains"
     params = {"symbol": symbol, "expiration": expiration}
     r = requests.get(url, headers=TRADIER_HEADERS, params=params)
-    data = r.json()
-    return data.get("options", {}).get("option", [])
+    if r.status_code != 200:
+        return [], []
+    options = r.json().get("options", {}).get("option", [])
+    calls = [o for o in options if o.get("option_type") == "call"]
+    puts = [o for o in options if o.get("option_type") == "put"]
+    return calls, puts
 
-def fetch_hv(symbol):
+def get_historical_volatility(symbol):
     try:
-        hist = yf.Ticker(symbol).history(period="90d")
-        returns = hist["Close"].pct_change().dropna()
-        return returns.std() * np.sqrt(252)  # Annualized HV
+        end = datetime.datetime.today()
+        start = end - datetime.timedelta(days=20)
+        df = yf.download(symbol, start=start, end=end)
+        df['returns'] = np.log(df['Close'] / df['Close'].shift(1))
+        hv = np.std(df['returns'].dropna()) * np.sqrt(252)
+        return hv
     except:
         return None
 
 def calculate_score(row, hv):
     try:
-        if pd.isna(row.get("iv")) or pd.isna(hv):
+        if row['iv'] is None or hv is None:
             return None
-        iv_hv_ratio = row["iv"] / hv if hv else 0.001
-        spread = row["ask"] - row["bid"]
-        efficiency = 1 - (spread / row["ask"]) if row["ask"] else 0
-        delta_score = 1 - abs(row["delta"] - 0.5)
-        score = (1 / iv_hv_ratio) * efficiency * delta_score * 100
-        return round(score, 2)
+        iv = float(row['iv'])
+        delta = abs(float(row['delta']))
+        spread = float(row['ask']) - float(row['bid'])
+        efficiency = 1 / (spread + 0.01)
+        score = ((iv / hv) * (1 - delta)) * efficiency
+        return round(score * 100, 2)
     except:
         return None
 
 def highlight_score(val):
-    if pd.isna(val):
-        return ""
-    if val >= 75:
-        return "color: #3ee27e;"  # green
-    elif val >= 50:
-        return "color: #ffe36e;"  # yellow
-    else:
-        return "color: #ff6b6b;"  # red
+    if val is None:
+        return ''
+    color = 'red' if val < 60 else 'yellow' if val < 80 else 'green'
+    return f'color: {color}; font-weight: bold'
 
-# ======================
-# 🌐 Streamlit UI
-# ======================
+# =========================
+# 🧠 App UI
+# =========================
 
-st.markdown("<h1 style='text-align:center;'>📈 StrikeFeed</h1>", unsafe_allow_html=True)
-st.markdown("<p style='text-align:center;'>Last updated: " + datetime.datetime.utcnow().strftime("%I:%M:%S %p UTC") + "</p>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align: center;'>📉 StrikeFeed</h1>", unsafe_allow_html=True)
+st.caption(f"Last updated: {datetime.datetime.utcnow().strftime('%H:%M:%S')} UTC")
 
-symbol = st.selectbox("🔍 Search Ticker", ["AAPL", "TSLA", "NVDA", "AMD", "MSFT", "SPY"])
+ticker = st.selectbox("🔍 Search Ticker", ["AAPL", "TSLA", "NVDA", "AMD", "MSFT", "META"], index=0)
 
-if symbol:
-    expirations = fetch_expirations(symbol)
-    if expirations:
-        expiration = st.selectbox("📅 Expiration", expirations[:4])
-        if expiration:
-            options = fetch_options_chain(symbol, expiration)
-            df = pd.DataFrame(options)
+expirations = fetch_expirations(ticker)
+expiration = st.selectbox("📅 Expiration", expirations) if expirations else None
 
-            if not df.empty:
-                df = df[df["option_type"].isin(["call", "put"])]
-                df = df[["option_type", "strike", "bid", "ask", "delta", "iv"]]
-                df.columns = ["Type", "Strike", "Bid", "Ask", "Delta", "IV"]
-                df = df.dropna(subset=["Strike", "Bid", "Ask", "Delta"])
-                hv = fetch_hv(symbol)
+if expiration:
+    calls, puts = fetch_option_chain(ticker, expiration)
+    hv = get_historical_volatility(ticker)
 
-                df["Score"] = df.apply(lambda row: calculate_score(row, hv), axis=1)
-                df = df.sort_values(by="Strike")
+    if calls and puts:
+        df = pd.DataFrame(calls + puts)
+        required_cols = ["option_type", "strike", "bid", "ask", "delta", "iv"]
 
-                styled = df.style.applymap(highlight_score, subset=["Score"])
-                st.dataframe(styled, use_container_width=True)
-            else:
-                st.warning("No option chain data returned.")
+        if all(col in df.columns for col in required_cols):
+            df = df[required_cols].copy()
+            df['score'] = df.apply(lambda row: calculate_score(row, hv), axis=1)
+
+            styled_df = df.style.applymap(highlight_score, subset=["score"])
+            st.dataframe(styled_df, use_container_width=True)
         else:
-            st.warning("Please select an expiration.")
+            st.warning("⚠️ Some data fields are missing from Tradier's response.")
     else:
-        st.warning("No expirations found for this ticker.")
+        st.warning("⚠️ No option chain data available for this expiration.")
 else:
-    st.warning("Please select a ticker.")
+    st.warning("⚠️ No expirations available for this ticker.")
