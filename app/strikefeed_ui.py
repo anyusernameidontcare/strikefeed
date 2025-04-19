@@ -47,9 +47,12 @@ def fetch_hv(symbol):
         return None
 
 def calculate_score(row, hv):
-    if row["iv"] is None or hv is None or row["iv"] == 0:
+    if not isinstance(row, dict):
         return None
-    iv_hv_ratio = row["iv"] / hv
+    iv = row.get("iv")
+    if iv is None or hv is None or iv == 0:
+        return None
+    iv_hv_ratio = iv / hv
     if iv_hv_ratio == 0:
         return None
     score = (1 / iv_hv_ratio) * 100
