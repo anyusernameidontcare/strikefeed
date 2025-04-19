@@ -6,122 +6,121 @@ import pytz
 import requests
 import yfinance as yf
 
-# API Token
-TRADIER_TOKEN = "eA5ZaGxFG0fVxMqtIS7GAAA2S7W"  # REPLACE THIS
+# ----------------------------------------------------
+# API Tokens
+# ----------------------------------------------------
+TRADIER_TOKEN = "eA5AZaGxFGOfVxMqtIS7GAA4ZS7W"  # Replace with your actual Tradier API token
 TRADIER_HEADERS = {
     "Authorization": f"Bearer {TRADIER_TOKEN}",
     "Accept": "application/json"
 }
 
+# ----------------------------------------------------
+# Helper Functions
+# ----------------------------------------------------
+
+def get_option_expirations(symbol):
+    url = f"https://api.tradier.com/v1/markets/options/expirations"
+    params = {"symbol": symbol, "includeAllRoots": "true", "strikes": "false"}
+    response = requests.get(url, headers=TRADIER_HEADERS, params=params)
+    if response.status_code != 200:
+        return []
+    return response.json().get("expirations", {}).get("date", [])
+
+def get_option_chain(symbol, expiration):
+    url = f"https://api.tradier.com/v1/markets/options/chains"
+    params = {"symbol": symbol, "expiration": expiration, "greeks": "true"}
+    response = requests.get(url, headers=TRADIER_HEADERS, params=params)
+    if response.status_code != 200:
+        return [], []
+    options = response.json().get("options", {}).get("option", [])
+    calls = [o for o in options if o["option_type"] == "call"]
+    puts = [o for o in options if o["option_type"] == "put"]
+    return calls, puts
+
+def get_historical_volatility(symbol):
+    try:
+        data = yf.Ticker(symbol).history(period="1mo")
+        returns = data["Close"].pct_change().dropna()
+        hv = np.std(returns) * np.sqrt(252)
+        return hv
+    except:
+        return None
+
+def score_option(iv, hv, bid, ask, delta):
+    if iv is None or hv is None or bid is None or ask is None:
+        return None
+
+    # Score is weighted based on IV/HV ratio, tight spread, and delta
+    iv_hv_ratio = iv / hv if hv else 0
+    spread = ask - bid if ask and bid else 0
+    spread_score = 1 - min(spread / max(ask, 0.01), 1)
+    delta_score = 1 - abs(delta)
+
+    score = (iv_hv_ratio * 0.5 + spread_score * 0.3 + delta_score * 0.2) * 100
+    return round(score, 2)
+
+# ----------------------------------------------------
+# Streamlit UI
+# ----------------------------------------------------
 st.set_page_config(page_title="StrikeFeed", layout="wide")
 st.markdown("""
     <h1 style='text-align: center;'>📈 StrikeFeed</h1>
-    <div style='text-align: center; font-size: 14px;'>Last updated: {} UTC</div>
-""".format(datetime.datetime.now(pytz.utc).strftime("%I:%M:%S %p")), unsafe_allow_html=True)
+    <p style='text-align: center; font-size: 0.9em;'>Last updated: {} UTC</p>
+""".format(datetime.datetime.utcnow().strftime("%I:%M:%S %p")), unsafe_allow_html=True)
 
-# --- Ticker Search ---
-st.markdown("#### 🔍 Search Ticker")
-ticker = st.selectbox("", options=["AAPL", "TSLA", "NVDA", "AMD", "MSFT", "AMZN"], label_visibility="collapsed")
+symbol = st.selectbox("🔍 Search Ticker", options=["AAPL", "NVDA", "TSLA", "AMD"], index=0)
+expirations = get_option_expirations(symbol)
+expiration = st.selectbox("Expiration", options=expirations)
 
-# --- Fetch Expirations ---
-def get_expirations(symbol):
-    url = f"https://api.tradier.com/v1/markets/options/expirations?symbol={symbol}&includeAllRoots=true&strikes=false"
-    r = requests.get(url, headers=TRADIER_HEADERS)
-    if r.status_code != 200:
-        return []
-    return r.json()['expirations']['date']
+if symbol and expiration:
+    calls, puts = get_option_chain(symbol, expiration)
+    hv = get_historical_volatility(symbol)
 
-# --- Get All Expirations ---
-expirations = get_expirations(ticker)
-expirations_df = []
-today = datetime.date.today()
-for exp in expirations:
-    exp_date = datetime.datetime.strptime(exp, "%Y-%m-%d").date()
-    dte = (exp_date - today).days
-    if 0 <= dte <= 28:
-        expirations_df.append({
-            "label": f"{dte}D - {exp_date.strftime('%a %b %d')}",
-            "value": exp
-        })
+    calls_df = pd.DataFrame(calls)
+    puts_df = pd.DataFrame(puts)
 
-# --- Expiration Select ---
-st.markdown("#### Expiration")
-expiration_select = st.selectbox("", options=[e["label"] for e in expirations_df], label_visibility="collapsed")
-selected_exp_date = next((e['value'] for e in expirations_df if e['label'] == expiration_select), None)
-
-# --- Fetch Chain ---
-def get_option_chain(symbol, expiration):
-    url = f"https://api.tradier.com/v1/markets/options/chains?symbol={symbol}&expiration={expiration}&greeks=true"
-    r = requests.get(url, headers=TRADIER_HEADERS)
-    if r.status_code != 200:
-        return []
-    return r.json()['options']['option']
-
-chain_data = get_option_chain(ticker, selected_exp_date)
-
-def get_hv(symbol):
-    hist = yf.Ticker(symbol).history(period="1mo")
-    log_returns = np.log(hist['Close'] / hist['Close'].shift(1)).dropna()
-    return log_returns.std() * np.sqrt(252)
-
-hv = get_hv(ticker)
-
-# --- Calculate Score ---
-def score_option(row):
-    if row['iv'] is None or row['delta'] is None or hv == 0:
-        return None
-    iv_score = 1 - abs(row['iv'] / hv - 1)
-    delta_score = 1 - abs(abs(row['delta']) - 0.5) * 2
-    spread = abs(row['ask'] - row['bid']) if row['ask'] and row['bid'] else 1
-    spread_score = 1 - min(spread / (row['bid'] + 0.01), 1)
-    final_score = (0.5 * iv_score + 0.3 * delta_score + 0.2 * spread_score) * 100
-    return round(final_score, 2)
-
-# --- Format Layout ---
-calls = []
-puts = []
-for opt in chain_data:
-    entry = {
-        'type': opt['option_type'],
-        'strike': opt['strike'],
-        'bid': opt['bid'],
-        'ask': opt['ask'],
-        'delta': opt['greeks'].get('delta') if opt['greeks'] else None,
-        'iv': opt['greeks'].get('iv') if opt['greeks'] else None,
-    }
-    entry['score'] = score_option(entry)
-    if opt['option_type'] == 'call':
-        calls.append(entry)
+    if "strike" in calls_df.columns:
+        calls_df = calls_df.set_index("strike")
     else:
-        puts.append(entry)
+        calls_df = pd.DataFrame(columns=["bid", "ask", "delta", "iv", "score"])
 
-calls_df = pd.DataFrame(calls).set_index("strike")
-puts_df = pd.DataFrame(puts).set_index("strike")
+    if "strike" in puts_df.columns:
+        puts_df = puts_df.set_index("strike")
+    else:
+        puts_df = pd.DataFrame(columns=["bid", "ask", "delta", "iv", "score"])
 
-# --- Display Table ---
-merged_df = pd.concat([
-    calls_df[['bid', 'ask']],
-    calls_df[['bid', 'ask']].columns.map(lambda x: f"Call {x.title()}"),
-    puts_df[['bid', 'ask']],
-    puts_df[['bid', 'ask']].columns.map(lambda x: f"Put {x.title()}"),
-], axis=1, keys=['Call Bid', 'Call Ask', 'Put Bid', 'Put Ask'])
+    for df in [calls_df, puts_df]:
+        for idx in df.index:
+            row = df.loc[idx]
+            iv = row.get("greeks", {}).get("iv")
+            delta = row.get("greeks", {}).get("delta")
+            bid = row.get("bid")
+            ask = row.get("ask")
+            score = score_option(iv, hv, bid, ask, delta)
+            df.at[idx, "iv"] = iv
+            df.at[idx, "delta"] = delta
+            df.at[idx, "score"] = score
 
-merged_df['Score'] = calls_df['score']  # just as placeholder, adjust logic if needed
+    combined = pd.concat([
+        calls_df[["bid", "ask", "delta", "iv", "score"]].rename(columns={"bid": "Call Bid", "ask": "Call Ask"}),
+        pd.DataFrame(index=calls_df.index).index.to_frame(name="Strike"),
+        puts_df[["bid", "ask", "delta", "iv", "score"]].rename(columns={"bid": "Put Bid", "ask": "Put Ask", "score": "Score"})
+    ], axis=1)
 
-# --- Score Styling ---
-def color_score(val):
-    if pd.isna(val): return 'color: #999999'
-    if val > 75: return 'color: #2ecc71'
-    elif val > 60: return 'color: #f1c40f'
-    else: return 'color: #e74c3c'
+    def highlight_score(val):
+        if val is None:
+            return "color: #ccc"
+        val = float(val)
+        if val >= 80:
+            return "color: lightgreen"
+        elif val >= 60:
+            return "color: gold"
+        else:
+            return "color: lightcoral"
 
-styled = merged_df.style.format("{:.2f}").applymap(color_score, subset=['Score'])
+    st.dataframe(combined.reset_index(drop=True).style.applymap(highlight_score, subset=["Score"]))
 
-st.dataframe(styled, use_container_width=True)
-
-st.markdown("""
----
-<div style='text-align: center; font-size: 13px;'>
-    StrikeFeed — Powered by Tradier + Yahoo
-</div>
-""", unsafe_allow_html=True)
+    st.markdown("""
+    <p style='text-align: center; font-size: 0.8em;'>StrikeFeed — Powered by Tradier + Yahoo</p>
+    """, unsafe_allow_html=True)
