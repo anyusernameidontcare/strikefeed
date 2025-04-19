@@ -1,83 +1,36 @@
+# ===============================
+# ⚡ strikefeed_ui.py (Main App)
+# ===============================
 import streamlit as st
 import pandas as pd
-import numpy as np
-import requests
-import yfinance as yf
 import datetime
 
-# ===============================
-# 🔐 Tradier API Configuration
-# ===============================
-TRADIER_TOKEN = "OiteBPyAfIXoXsE1F0yoUV5pKddR"
-TRADIER_HEADERS = {
-    "Authorization": f"Bearer {TRADIER_TOKEN}",
-    "Accept": "application/json"
-}
-BASE_URL = "https://api.tradier.com/v1/markets/options"
+from config import TICKERS
+from scoring import calculate_score
+from layout import render_score_key, show_greek_toggle, style_cell
+from tradier_api import get_expirations, get_option_chain, get_current_price, get_historical_volatility
 
-# ===============================
-# 📈 Ticker List
-# ===============================
-TICKERS = ["AAPL", "TSLA", "MSFT", "NVDA", "SPY"]
-
-# ===============================
-# 🧠 Data Functions
-# ===============================
-def get_expirations(symbol):
-    res = requests.get(f"{BASE_URL}/expirations", headers=TRADIER_HEADERS, params={"symbol": symbol})
-    return res.json()["expirations"]["date"]
-
-def get_option_chain(symbol, expiration):
-    res = requests.get(f"{BASE_URL}/chains", headers=TRADIER_HEADERS, params={"symbol": symbol, "expiration": expiration, "greeks": "true"})
-    return res.json()["options"]["option"]
-
-def get_current_price(symbol):
-    return yf.Ticker(symbol).info.get("regularMarketPrice", 0)
-
-def get_hv(symbol):
-    try:
-        hist = yf.Ticker(symbol).history(period="30d")["Close"]
-        returns = np.log(hist / hist.shift(1)).dropna()
-        return np.std(returns) * np.sqrt(252)
-    except:
-        return None
-
-def calculate_score(opt, hv):
-    try:
-        greeks = opt.get("greeks", {})
-        iv = greeks.get("iv")
-        delta = abs(greeks.get("delta", 0))
-        bid = opt.get("bid", 0)
-        ask = opt.get("ask", 0)
-        if not iv or not hv or iv == 0 or ask == 0:
-            return None
-        iv_hv_ratio = iv / hv
-        spread_pct = (ask - bid) / ask if ask else 1
-        efficiency = bid / ask if ask else 0
-        delta_score = 1 - abs(delta - 0.4)
-        score = (1 / iv_hv_ratio) * 40 + (1 - spread_pct) * 30 + delta_score * 20 + efficiency * 10
-        return round(score, 1)
-    except:
-        return None
-
-# ===============================
-# 🚀 Streamlit UI
-# ===============================
+# Streamlit Setup
 st.set_page_config(layout="wide")
 st.markdown("<h2 style='text-align:center;'>⚡ StrikeFeed</h2>", unsafe_allow_html=True)
 
+# User Controls
 symbol = st.selectbox("Ticker", TICKERS)
 expirations = get_expirations(symbol)
 expiration = st.selectbox("Expiration", expirations)
 current_price = get_current_price(symbol)
+
 st.markdown(f"<p style='text-align:center;'>Current Price: ${current_price:.2f}</p>", unsafe_allow_html=True)
+show_raw = show_greek_toggle()
+render_score_key()
 
+# Data Fetching
 options = get_option_chain(symbol, expiration)
-hv = get_hv(symbol)
-
+hv = get_historical_volatility(symbol)
 calls = [o for o in options if o["option_type"] == "call" and o.get("bid", 0) > 0]
 puts = [o for o in options if o["option_type"] == "put" and o.get("bid", 0) > 0]
 
+# Match by strike
 rows = []
 for c, p in zip(calls, puts):
     strike = c.get("strike")
@@ -96,28 +49,10 @@ for c, p in zip(calls, puts):
     }
     rows.append(row)
 
-show_raw = st.checkbox("Show Raw Score Inputs (IV, HV, Delta)", value=False)
+# Display
+visible_cols = ["Call Bid", "Call Ask", "Call Score", "Strike", "Put Bid", "Put Ask", "Put Score"]
+extra_cols = ["Call Delta", "Put Delta", "IV", "HV"]
+final_cols = visible_cols + extra_cols if show_raw else visible_cols
+
 df = pd.DataFrame(rows)
-
-if not show_raw:
-    df = df[["Call Bid", "Call Ask", "Call Score", "Strike", "Put Bid", "Put Ask", "Put Score"]]
-
-# Display styled table
-st.dataframe(
-    df.style.set_properties(**{
-        'text-align': 'center',
-        'font-size': '16px'
-    }),
-    use_container_width=True
-)
-
-# Always-on Score Key
-st.markdown("""
-    <div style='position: fixed; bottom: 16px; left: 16px; background: #111; padding: 10px 15px; border-radius: 8px; color: white; font-size: 12px;'>
-    <b>🧠 Score Key</b><br>
-    • IV/HV Ratio × 40<br>
-    • Spread Efficiency × 30<br>
-    • Delta Strength × 20<br>
-    • Bid/Ask Efficiency × 10
-    </div>
-""", unsafe_allow_html=True)
+st.dataframe(df[final_cols].style.applymap(style_cell), use_container_width=True)
