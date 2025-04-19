@@ -25,11 +25,12 @@ def get_market_status():
 status = get_market_status()
 
 # ─────────────────────────────────────────────
-# Page Settings
+# Page Layout
 # ─────────────────────────────────────────────
 
 st.set_page_config(layout="wide")
-st.markdown("<h1 style='text-align: center; font-size: 3em;'>📈 StrikeFeed</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align: center; font-size: 2.5em;'>📈 StrikeFeed</h1>", unsafe_allow_html=True)
+st.markdown(f"<p style='text-align: center; color: gray;'>Last updated: {datetime.datetime.now().strftime('%I:%M:%S %p')}</p>", unsafe_allow_html=True)
 
 if status == "open":
     st.markdown("<p style='text-align: right; color: #00e676;'>✅ Market Open</p>", unsafe_allow_html=True)
@@ -39,54 +40,59 @@ else:
     st.markdown("<p style='text-align: right; color: #ef4444;'>❌ Market Closed</p>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# Load or mock data
+# Load Data
 # ─────────────────────────────────────────────
 
 if status == "open":
-    df = pd.read_csv("app/strikefeed_mock_data.csv")  # Live later
+    df = pd.read_csv("app/strikefeed_mock_data.csv")
     df['Score'] = df['Score'].replace('%', '', regex=False).astype(float)
 else:
-    # Empty frame with dashes
-    cols = ["Strike", "Type", "Bid", "Ask", "Delta", "IV", "Score"]
-    df = pd.DataFrame({col: ["—"]*10 for col in cols})
+    df = pd.DataFrame(columns=["Strike", "Type", "Bid", "Ask", "Delta", "IV", "Score"])
 
 # ─────────────────────────────────────────────
-# Ticker Search
+# Ticker Search + Filter
 # ─────────────────────────────────────────────
 
-tickers = sorted(df["Ticker"].dropna().unique()) if status == "open" else []
+st.markdown("### ")
+tickers = sorted(df["Ticker"].dropna().unique()) if not df.empty else []
 selected_ticker = st.selectbox("🔍 Search Ticker", options=[""] + tickers)
 
 if status == "open" and selected_ticker:
     df = df[df["Ticker"] == selected_ticker]
 
-    # Separate calls and puts
-    calls = df[df["Type"] == "call"].copy()
-    puts = df[df["Type"] == "put"].copy()
+    # Split into calls/puts
+    calls = df[df["Type"] == "call"][["Strike", "Bid", "Ask"]].rename(columns={
+        "Bid": "Call Bid", "Ask": "Call Ask"
+    })
 
-    # Align by strike
-    merged = pd.merge(
-        calls[["Strike", "Bid", "Ask"]],
-        puts[["Strike", "Bid", "Ask"]],
-        on="Strike",
-        how="outer",
-        suffixes=("_call", "_put")
-    ).sort_values("Strike")
+    puts = df[df["Type"] == "put"][["Strike", "Bid", "Ask"]].rename(columns={
+        "Bid": "Put Bid", "Ask": "Put Ask"
+    })
 
-    # Add headers
-    merged.columns = ["Strike", "Call Bid", "Call Ask", "Put Bid", "Put Ask"]
+    # Merge by Strike
+    merged = pd.merge(calls, puts, on="Strike", how="outer").sort_values("Strike")
     merged = merged[["Call Bid", "Call Ask", "Strike", "Put Bid", "Put Ask"]]
-
-    # Fill empty values with —
     merged.fillna("—", inplace=True)
 
-    # Display side-by-side format
-    st.dataframe(merged.style.set_properties(**{
-        "text-align": "center"
-    }), use_container_width=True)
+    # Format table
+    styled = merged.style.set_properties(**{
+        "text-align": "center",
+        "font-size": "14px",
+        "background-color": "#111111",
+        "color": "white"
+    })
+
+    st.dataframe(styled, use_container_width=True)
 
 else:
-    # Show placeholder table if no ticker or market closed
-    cols = ["Call Bid", "Call Ask", "Strike", "Put Bid", "Put Ask"]
-    placeholder_df = pd.DataFrame({col: ["—"]*10 for col in cols})
-    st.dataframe(placeholder_df, use_container_width=True)
+    # Placeholder table if closed or no ticker
+    columns = ["Call Bid", "Call Ask", "Strike", "Put Bid", "Put Ask"]
+    blank = pd.DataFrame({col: ["—"]*10 for col in columns})
+    st.dataframe(blank, use_container_width=True)
+
+# ─────────────────────────────────────────────
+# Footer
+# ─────────────────────────────────────────────
+
+st.markdown("### ")
+st.markdown("<div style='text-align:center; color:gray;'>StrikeFeed – Real-time options scanner</div>", unsafe_allow_html=True)
