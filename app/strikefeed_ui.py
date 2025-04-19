@@ -8,7 +8,7 @@ import yfinance as yf
 # ======================
 # ✅ Tradier API Setup
 # ======================
-TRADIER_TOKEN = "OiteBPyAfIXoXsE1F0yoUV5pKddR" "
+TRADIER_TOKEN = "OiteBPyAfIXoXsE1F0yoUV5pKddR"
 TRADIER_HEADERS = {
     "Authorization": f"Bearer {TRADIER_TOKEN}",
     "Accept": "application/json"
