@@ -1,166 +1,157 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 import datetime
 import pytz
-import requests
 import yfinance as yf
 
-# ─────────────────────────────────────────────
-# API Tokens
-# ─────────────────────────────────────────────
-TRADIER_TOKEN = "YOUR_LIVE_TRADIER_TOKEN"  # ← REPLACE THIS
+# Tradier API setup
+TRADIER_TOKEN = "YOUR_TRADIER_TOKEN"  # Replace with your real token
 TRADIER_HEADERS = {
     "Authorization": f"Bearer {TRADIER_TOKEN}",
     "Accept": "application/json"
 }
 
-# ─────────────────────────────────────────────
-# HV Calculation from Yahoo
-# ─────────────────────────────────────────────
-def get_hv(ticker, days=20):
-    data = yf.download(ticker, period='60d', interval='1d', progress=False)
-    if data.empty or 'Adj Close' not in data:
-        return None
-    data['returns'] = np.log(data['Adj Close'] / data['Adj Close'].shift(1))
-    std_dev = data['returns'].rolling(window=days).std().iloc[-1]
-    hv = std_dev * np.sqrt(252) * 100
-    return round(hv, 2)
+# Cache to store last market data fallback
+cached_data = {}
 
-# ─────────────────────────────────────────────
-# Tradier Expiration Dates
-# ─────────────────────────────────────────────
-def get_expirations(ticker):
-    url = f"https://api.tradier.com/v1/markets/options/expirations"
-    params = {"symbol": ticker}
+# --- Utility Functions ---
+
+def is_market_open():
+    now = datetime.datetime.now(pytz.timezone("US/Eastern"))
+    if now.weekday() >= 5:
+        return False
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+def get_next_fridays(n=4):
+    today = datetime.date.today()
+    fridays = []
+    while len(fridays) < n:
+        today += datetime.timedelta(days=1)
+        if today.weekday() == 4:
+            fridays.append(today.strftime("%Y-%m-%d"))
+    return fridays
+
+def fetch_option_chain(symbol, expiration):
+    url = f"https://api.tradier.com/v1/markets/options/chains?symbol={symbol}&expiration={expiration}&greeks=true"
+    response = requests.get(url, headers=TRADIER_HEADERS)
+    if response.status_code != 200:
+        return None
+    data = response.json()
+    return data.get("options", {}).get("option", [])
+
+def fetch_hv(symbol):
     try:
-        response = requests.get(url, headers=TRADIER_HEADERS, params=params)
-        data = response.json()
-        return data['expirations']['date'][:4]  # Limit to next 4 Fridays
+        df = yf.download(symbol, period="1mo")
+        returns = df['Close'].pct_change().dropna()
+        hv = np.std(returns) * np.sqrt(252)
+        return round(hv, 4)
     except:
+        return None
+
+def calculate_score(option, hv):
+    try:
+        iv = float(option.get("greeks", {}).get("iv", 0))
+        delta = abs(float(option.get("greeks", {}).get("delta", 0)))
+        bid = float(option.get("bid", 0))
+        ask = float(option.get("ask", 0))
+
+        if not all([iv, hv, bid, ask]):
+            return None
+
+        midpoint = (bid + ask) / 2
+        spread = ask - bid
+        spread_pct = spread / midpoint if midpoint else 1
+
+        iv_hv_ratio = iv / hv if hv else 0
+        delta_score = 1 - abs(delta - 0.4)  # sweet spot near 0.4
+        efficiency = bid / midpoint if midpoint else 0
+
+        score = (
+            (1 / iv_hv_ratio) * 35 +     # lower IV/HV is better
+            (1 - spread_pct) * 25 +      # tighter spread is better
+            delta_score * 20 +           # ideal delta near 0.4
+            efficiency * 20              # good bid vs midpoint
+        )
+
+        return round(min(max(score, 0), 100), 2)
+    except:
+        return None
+
+def get_data(symbol, expiration):
+    hv = fetch_hv(symbol)
+    options = fetch_option_chain(symbol, expiration)
+    rows = []
+
+    if not options:
         return []
 
-# ─────────────────────────────────────────────
-# Tradier Option Chain
-# ─────────────────────────────────────────────
-def get_option_chain(ticker, expiration):
-    url = "https://api.tradier.com/v1/markets/options/chains"
-    params = {"symbol": ticker, "expiration": expiration, "greeks": "true"}
-    try:
-        response = requests.get(url, headers=TRADIER_HEADERS, params=params)
-        data = response.json()
-        return pd.DataFrame(data["options"]["option"])
-    except:
-        return pd.DataFrame()
+    for opt in options:
+        score = calculate_score(opt, hv)
+        row = {
+            "Type": opt.get("option_type"),
+            "Strike": opt.get("strike"),
+            "Bid": opt.get("bid"),
+            "Ask": opt.get("ask"),
+            "Delta": opt.get("greeks", {}).get("delta"),
+            "IV": opt.get("greeks", {}).get("iv"),
+            "Score": score
+        }
+        rows.append(row)
+    return rows
 
-# ─────────────────────────────────────────────
-# Market Status
-# ─────────────────────────────────────────────
-def get_market_status():
-    now = datetime.datetime.now(pytz.timezone("US/Eastern"))
-    open_time = now.replace(hour=9, minute=30, second=0)
-    close_time = now.replace(hour=16, minute=0, second=0)
-    if now.weekday() >= 5: return "closed"
-    elif now < open_time: return "pre-market"
-    elif now > close_time: return "after-hours"
-    else: return "open"
+# --- Streamlit UI ---
 
-# ─────────────────────────────────────────────
-# Scoring Function
-# ─────────────────────────────────────────────
-def score_option(row, hv):
-    try:
-        iv = row["implied_volatility"] * 100
-        bid = row["bid"]
-        ask = row["ask"]
-        delta = abs(row["delta"])
-        mid = (bid + ask) / 2
-        spread_pct = (ask - bid) / mid if mid else 1
-        efficiency = bid / mid if mid else 0
-        iv_hv_ratio = iv / hv if hv else 10
-
-        if iv_hv_ratio < 0.8: iv_score = 95
-        elif iv_hv_ratio < 1.0: iv_score = 85
-        elif iv_hv_ratio < 1.2: iv_score = 65
-        else: iv_score = 45
-
-        if spread_pct < 0.02: spread_score = 90
-        elif spread_pct < 0.05: spread_score = 75
-        elif spread_pct < 0.10: spread_score = 60
-        else: spread_score = 40
-
-        if 0.30 <= delta <= 0.50: delta_score = 85
-        elif 0.20 <= delta <= 0.60: delta_score = 70
-        else: delta_score = 50
-
-        if efficiency >= 0.95: eff_score = 90
-        elif efficiency >= 0.85: eff_score = 75
-        else: eff_score = 60
-
-        final = (
-            iv_score * 0.40 +
-            spread_score * 0.30 +
-            delta_score * 0.15 +
-            eff_score * 0.15
-        )
-        return round(final, 1)
-    except:
-        return None
-
-def color_score(val):
-    if val is None or pd.isna(val): return ""
-    if val >= 80: return "color: #34d399;"
-    elif val >= 60: return "color: #facc15;"
-    else: return "color: #f87171;"
-
-# ─────────────────────────────────────────────
-# Streamlit UI
-# ─────────────────────────────────────────────
-status = get_market_status()
 st.set_page_config(layout="wide")
-st.markdown("<h1 style='text-align: center;'>📈 StrikeFeed</h1>", unsafe_allow_html=True)
-st.markdown(f"<p style='text-align: center; color: gray;'>Last updated: {datetime.datetime.now().strftime('%I:%M:%S %p')}</p>", unsafe_allow_html=True)
-if status == "open":
-    st.markdown("<p style='text-align: right; color: #00e676;'>✅ Market Open</p>", unsafe_allow_html=True)
-elif status == "after-hours":
-    st.markdown("<p style='text-align: right; color: #facc15;'>🌙 After Hours</p>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center;'>📈 StrikeFeed</h1>", unsafe_allow_html=True)
+st.markdown(f"<p style='text-align:center;'>Last updated: {datetime.datetime.now().strftime('%I:%M:%S %p')}</p>", unsafe_allow_html=True)
+
+# Market status
+if is_market_open():
+    st.markdown("<p style='color:green; float:right;'>✔ Market Open</p>", unsafe_allow_html=True)
 else:
-    st.markdown("<p style='text-align: right; color: #ef4444;'>❌ Market Closed</p>", unsafe_allow_html=True)
+    st.markdown("<p style='color:gold; float:right;'>🌙 After Hours</p>", unsafe_allow_html=True)
 
-st.markdown("### ")
-ticker = st.selectbox("🔍 Search Ticker", options=["", "AAPL", "TSLA", "NVDA", "SPY", "QQQ", "MSFT", "META", "AMD"])
+# User inputs
+symbols = ["AAPL", "TSLA", "NVDA", "AMD", "MSFT", "SPY"]
+symbol = st.selectbox("🔍 Search Ticker", symbols)
 
-if ticker:
-    hv = get_hv(ticker)
-    expirations = get_expirations(ticker)
-    expiration = st.selectbox("Select Expiration", expirations)
+expirations = get_next_fridays()
+expiration = st.selectbox("Expiration Date", expirations)
 
-    if expiration:
-        df = get_option_chain(ticker, expiration)
-        if not df.empty:
-            df["Score"] = df.apply(lambda row: score_option(row, hv), axis=1)
+# Load data
+rows = []
+if is_market_open():
+    rows = get_data(symbol, expiration)
+    if rows:
+        cached_data[(symbol, expiration)] = rows
+else:
+    rows = cached_data.get((symbol, expiration), [])
 
-            calls = df[df["option_type"] == "call"][["strike", "bid", "ask", "Score"]].rename(columns={
-                "bid": "Call Bid", "ask": "Call Ask"
-            })
-            puts = df[df["option_type"] == "put"]["strike", "bid", "ask"].rename(columns={
-                "bid": "Put Bid", "ask": "Put Ask"
-            })
+# Display table
+df = pd.DataFrame(rows)
+if not df.empty:
+    df["Score"] = df["Score"].apply(lambda x: f"{x}%" if pd.notnull(x) else "—")
 
-            merged = pd.merge(calls, puts, on="strike", how="outer").sort_values("strike")
-            merged = merged[["Call Bid", "Call Ask", "strike", "Put Bid", "Put Ask", "Score"]]
-            merged.rename(columns={"strike": "Strike"}, inplace=True)
-            merged.fillna("—", inplace=True)
-
-            st.dataframe(merged.style.applymap(color_score, subset=["Score"]).set_properties(**{
-                "text-align": "center",
-                "font-size": "14px"
-            }), use_container_width=True)
+    def color_score(val):
+        if val == "—" or pd.isnull(val):
+            return ""
+        val = float(val.strip('%'))
+        if val >= 80:
+            return "color: rgb(100,255,100); font-weight: bold;"
+        elif val >= 60:
+            return "color: rgb(255,225,100); font-weight: bold;"
         else:
-            st.warning("⚠️ No option data available for this expiration.")
-else:
-    blank = pd.DataFrame({col: ["—"]*10 for col in ["Call Bid", "Call Ask", "Strike", "Put Bid", "Put Ask", "Score"]})
-    st.dataframe(blank, use_container_width=True)
+            return "color: rgb(255,120,120); font-weight: bold;"
 
-st.markdown("### ")
-st.markdown("<div style='text-align:center; color:gray;'>StrikeFeed – Powered by Tradier + Yahoo</div>", unsafe_allow_html=True)
+    st.dataframe(
+        df.style.applymap(color_score, subset=["Score"]),
+        use_container_width=True
+    )
+else:
+    st.info("No data available yet. Try again during market hours.")
+
+st.markdown("<p style='text-align:center;'>StrikeFeed — Powered by Tradier + Yahoo</p>", unsafe_allow_html=True)
