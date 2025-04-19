@@ -60,18 +60,33 @@ selected_ticker = st.selectbox("🔍 Search Ticker", options=[""] + tickers)
 if status == "open" and selected_ticker:
     df = df[df["Ticker"] == selected_ticker]
 
-# ─────────────────────────────────────────────
-# Display Table
-# ─────────────────────────────────────────────
+    # Separate calls and puts
+    calls = df[df["Type"] == "call"].copy()
+    puts = df[df["Type"] == "put"].copy()
 
-st.markdown("### ")
-st.dataframe(df.style.set_properties(**{
-    "text-align": "center"
-}), use_container_width=True)
+    # Align by strike
+    merged = pd.merge(
+        calls[["Strike", "Bid", "Ask"]],
+        puts[["Strike", "Bid", "Ask"]],
+        on="Strike",
+        how="outer",
+        suffixes=("_call", "_put")
+    ).sort_values("Strike")
 
-# ─────────────────────────────────────────────
-# Footer
-# ─────────────────────────────────────────────
+    # Add headers
+    merged.columns = ["Strike", "Call Bid", "Call Ask", "Put Bid", "Put Ask"]
+    merged = merged[["Call Bid", "Call Ask", "Strike", "Put Bid", "Put Ask"]]
 
-st.markdown("### ")
-st.markdown("<div style='text-align:center; color:gray;'>StrikeFeed – Real-time options scanner</div>", unsafe_allow_html=True)
+    # Fill empty values with —
+    merged.fillna("—", inplace=True)
+
+    # Display side-by-side format
+    st.dataframe(merged.style.set_properties(**{
+        "text-align": "center"
+    }), use_container_width=True)
+
+else:
+    # Show placeholder table if no ticker or market closed
+    cols = ["Call Bid", "Call Ask", "Strike", "Put Bid", "Put Ask"]
+    placeholder_df = pd.DataFrame({col: ["—"]*10 for col in cols})
+    st.dataframe(placeholder_df, use_container_width=True)
