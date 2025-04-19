@@ -1,122 +1,127 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
 import datetime
 import pytz
+import requests
 import yfinance as yf
 
-# ───── Tradier Settings ─────
-TRADIER_TOKEN = "eA5AZaGxFGOfVxMqtIS7GAA4ZS7W"
+# API Token
+TRADIER_TOKEN = "eA5ZaGxFG0fVxMqtIS7GAAA2S7W"  # REPLACE THIS
 TRADIER_HEADERS = {
     "Authorization": f"Bearer {TRADIER_TOKEN}",
     "Accept": "application/json"
 }
-cache_store = {}
 
-# ───── Utility ─────
-def is_market_open():
-    now = datetime.datetime.now(pytz.timezone("US/Eastern"))
-    if now.weekday() >= 5:
-        return False
-    return now.time() >= datetime.time(9,30) and now.time() <= datetime.time(16,0)
+st.set_page_config(page_title="StrikeFeed", layout="wide")
+st.markdown("""
+    <h1 style='text-align: center;'>📈 StrikeFeed</h1>
+    <div style='text-align: center; font-size: 14px;'>Last updated: {} UTC</div>
+""".format(datetime.datetime.now(pytz.utc).strftime("%I:%M:%S %p")), unsafe_allow_html=True)
 
-def get_next_fridays(n=4):
-    today = datetime.date.today()
-    fridays = []
-    while len(fridays) < n:
-        today += datetime.timedelta(days=1)
-        if today.weekday() == 4:
-            fridays.append(today.strftime("%Y-%m-%d"))
-    return fridays
+# --- Ticker Search ---
+st.markdown("#### 🔍 Search Ticker")
+ticker = st.selectbox("", options=["AAPL", "TSLA", "NVDA", "AMD", "MSFT", "AMZN"], label_visibility="collapsed")
 
-def fetch_hv(ticker):
-    try:
-        df = yf.download(ticker, period="1mo")
-        returns = df['Close'].pct_change().dropna()
-        return round(np.std(returns) * np.sqrt(252), 4)
-    except:
+# --- Fetch Expirations ---
+def get_expirations(symbol):
+    url = f"https://api.tradier.com/v1/markets/options/expirations?symbol={symbol}&includeAllRoots=true&strikes=false"
+    r = requests.get(url, headers=TRADIER_HEADERS)
+    if r.status_code != 200:
+        return []
+    return r.json()['expirations']['date']
+
+# --- Get All Expirations ---
+expirations = get_expirations(ticker)
+expirations_df = []
+today = datetime.date.today()
+for exp in expirations:
+    exp_date = datetime.datetime.strptime(exp, "%Y-%m-%d").date()
+    dte = (exp_date - today).days
+    if 0 <= dte <= 28:
+        expirations_df.append({
+            "label": f"{dte}D - {exp_date.strftime('%a %b %d')}",
+            "value": exp
+        })
+
+# --- Expiration Select ---
+st.markdown("#### Expiration")
+expiration_select = st.selectbox("", options=[e["label"] for e in expirations_df], label_visibility="collapsed")
+selected_exp_date = next((e['value'] for e in expirations_df if e['label'] == expiration_select), None)
+
+# --- Fetch Chain ---
+def get_option_chain(symbol, expiration):
+    url = f"https://api.tradier.com/v1/markets/options/chains?symbol={symbol}&expiration={expiration}&greeks=true"
+    r = requests.get(url, headers=TRADIER_HEADERS)
+    if r.status_code != 200:
+        return []
+    return r.json()['options']['option']
+
+chain_data = get_option_chain(ticker, selected_exp_date)
+
+def get_hv(symbol):
+    hist = yf.Ticker(symbol).history(period="1mo")
+    log_returns = np.log(hist['Close'] / hist['Close'].shift(1)).dropna()
+    return log_returns.std() * np.sqrt(252)
+
+hv = get_hv(ticker)
+
+# --- Calculate Score ---
+def score_option(row):
+    if row['iv'] is None or row['delta'] is None or hv == 0:
         return None
+    iv_score = 1 - abs(row['iv'] / hv - 1)
+    delta_score = 1 - abs(abs(row['delta']) - 0.5) * 2
+    spread = abs(row['ask'] - row['bid']) if row['ask'] and row['bid'] else 1
+    spread_score = 1 - min(spread / (row['bid'] + 0.01), 1)
+    final_score = (0.5 * iv_score + 0.3 * delta_score + 0.2 * spread_score) * 100
+    return round(final_score, 2)
 
-def fetch_chain(ticker, exp):
-    url = f"https://api.tradier.com/v1/markets/options/chains"
-    params = {"symbol": ticker, "expiration": exp, "greeks": "true"}
-    r = requests.get(url, headers=TRADIER_HEADERS, params=params)
-    if r.status_code == 200:
-        return r.json().get("options", {}).get("option", [])
-    return []
+# --- Format Layout ---
+calls = []
+puts = []
+for opt in chain_data:
+    entry = {
+        'type': opt['option_type'],
+        'strike': opt['strike'],
+        'bid': opt['bid'],
+        'ask': opt['ask'],
+        'delta': opt['greeks'].get('delta') if opt['greeks'] else None,
+        'iv': opt['greeks'].get('iv') if opt['greeks'] else None,
+    }
+    entry['score'] = score_option(entry)
+    if opt['option_type'] == 'call':
+        calls.append(entry)
+    else:
+        puts.append(entry)
 
-def score_option(opt, hv):
-    try:
-        iv = float(opt["greeks"]["iv"])
-        delta = abs(float(opt["greeks"]["delta"]))
-        bid = float(opt["bid"])
-        ask = float(opt["ask"])
-        mid = (bid + ask) / 2
-        spread = (ask - bid) / mid if mid else 1
-        iv_hv = iv / hv if hv else 10
-        efficiency = bid / mid if mid else 0
-        delta_score = 1 - abs(delta - 0.4)
+calls_df = pd.DataFrame(calls).set_index("strike")
+puts_df = pd.DataFrame(puts).set_index("strike")
 
-        score = (
-            (1 / iv_hv) * 35 +
-            (1 - spread) * 25 +
-            delta_score * 20 +
-            efficiency * 20
-        )
-        return round(min(max(score, 0), 100), 2)
-    except:
-        return None
+# --- Display Table ---
+merged_df = pd.concat([
+    calls_df[['bid', 'ask']],
+    calls_df[['bid', 'ask']].columns.map(lambda x: f"Call {x.title()}"),
+    puts_df[['bid', 'ask']],
+    puts_df[['bid', 'ask']].columns.map(lambda x: f"Put {x.title()}"),
+], axis=1, keys=['Call Bid', 'Call Ask', 'Put Bid', 'Put Ask'])
 
-# ───── UI Layout ─────
-st.set_page_config(layout="wide")
-st.markdown("<h1 style='text-align:center;'>📈 StrikeFeed</h1>", unsafe_allow_html=True)
-st.markdown(f"<p style='text-align:center;'>Last updated: {datetime.datetime.now().strftime('%I:%M:%S %p')}</p>", unsafe_allow_html=True)
+merged_df['Score'] = calls_df['score']  # just as placeholder, adjust logic if needed
 
-market_status = "✅ Market Open" if is_market_open() else "🌙 After Hours"
-color = "#00e676" if "Open" in market_status else "#facc15"
-st.markdown(f"<p style='color:{color}; float:right;'>{market_status}</p>", unsafe_allow_html=True)
+# --- Score Styling ---
+def color_score(val):
+    if pd.isna(val): return 'color: #999999'
+    if val > 75: return 'color: #2ecc71'
+    elif val > 60: return 'color: #f1c40f'
+    else: return 'color: #e74c3c'
 
-tickers = ["AAPL", "TSLA", "NVDA", "MSFT", "SPY"]
-ticker = st.selectbox("🔍 Search Ticker", tickers)
-expirations = get_next_fridays()
-expiration = st.selectbox("Expiration", expirations)
+styled = merged_df.style.format("{:.2f}").applymap(color_score, subset=['Score'])
 
-# ───── Pull + Cache Data ─────
-key = (ticker, expiration)
-hv = fetch_hv(ticker)
+st.dataframe(styled, use_container_width=True)
 
-options = fetch_chain(ticker, expiration)
-if options:
-    cache_store[key] = options
-else:
-    options = cache_store.get(key, [])
-
-# ───── Table Display ─────
-rows = []
-for opt in options:
-    score = score_option(opt, hv)
-    rows.append({
-        "Type": opt.get("option_type"),
-        "Strike": opt.get("strike"),
-        "Bid": opt.get("bid"),
-        "Ask": opt.get("ask"),
-        "Delta": opt.get("greeks", {}).get("delta"),
-        "IV": opt.get("greeks", {}).get("iv"),
-        "Score": f"{score}%" if score is not None else "—"
-    })
-
-df = pd.DataFrame(rows)
-if not df.empty:
-    def color_score(val):
-        if val == "—" or pd.isnull(val): return ""
-        val = float(val.strip('%'))
-        if val >= 80: return "color: #34d399;"
-        elif val >= 60: return "color: #facc15;"
-        else: return "color: #f87171;"
-
-    st.dataframe(df.style.applymap(color_score, subset=["Score"]), use_container_width=True)
-else:
-    st.warning("No data available yet — please try again later.")
-
-st.markdown("<p style='text-align:center;'>StrikeFeed — Powered by Tradier + Yahoo</p>", unsafe_allow_html=True)
+st.markdown("""
+---
+<div style='text-align: center; font-size: 13px;'>
+    StrikeFeed — Powered by Tradier + Yahoo
+</div>
+""", unsafe_allow_html=True)
